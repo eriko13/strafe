@@ -153,13 +153,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func toggleControlArrows() {
         guard let hotkeys else { return }
         let newValue = !HotkeyManager.controlArrowsEnabled
-        let alert = NSAlert()
-        alert.messageText = newValue ? "Enable Control + arrows?" : "Disable Control + arrows?"
-        alert.informativeText = HotkeyManager.controlArrowSetup
-        alert.addButton(withTitle: newValue ? "Enable" : "Disable")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate()
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if newValue {
+            // Explain what turning it on does; turning it off needs no prompt.
+            let alert = NSAlert()
+            alert.messageText = "Enable Control + arrows?"
+            alert.informativeText = HotkeyManager.controlArrowSetup
+            alert.addButton(withTitle: "Enable")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate()
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
         HotkeyManager.persist(controlArrowsEnabled: newValue)
         hotkeys.applyStoredState()
         refresh()
@@ -201,6 +204,5 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let granted = Permissions.isAccessibilityGranted
         accessibilityItem.title = "Accessibility granted: \(granted ? "yes" : "no")"
         controlArrowsItem.state = HotkeyManager.controlArrowsEnabled ? .on : .off
-
     }
 }

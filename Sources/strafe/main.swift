@@ -100,7 +100,6 @@ func runCLI(_ args: [String], engine: GestureSwitchEngine) -> Int32 {
         print(HotkeyManager.controlArrowSetup)
         return 0
 
-
     default:
         FileHandle.standardError.write(Data("""
         strafe — near-instant macOS Spaces switching

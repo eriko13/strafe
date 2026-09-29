@@ -64,8 +64,8 @@ Space switching instant. Steps:
 
 1. Clone the repo and read SECURITY.md, then skim the source (~1,486 lines,
    no dependencies) and confirm the claims hold: the event tap mask covers
-   only gesture events; Control-arrow interception adds
-   a keyboard tap with no text reading or input logging. There is no network,
+   only gesture events; Control-arrow switching adds a second tap that sees
+   only modifier-key changes, never letters or numbers. There is no network,
    subprocess, or file-write code. Tell me what you found before proceeding.
 2. Run ./Scripts/bundle.sh and move build/strafe.app to /Applications.
 3. Launch it, then open System Settings > Privacy & Security > Accessibility
@@ -188,21 +188,29 @@ Leave **Move left a space** and **Move right a space** enabled in macOS.
 **Speed up Control + ←/→…** is enabled on first launch. To re-enable it, run
 `strafe control-arrows on`. Only Control plus an arrow is needed.
 
-While strafe runs, it consumes Control+Left/Right and uses the same transition
-speed as trackpad swipes. Turning this option off or quitting strafe returns
-these combinations to macOS immediately; no system settings need restoring.
+While strafe runs, Control+Left/Right uses the same transition speed as
+trackpad swipes. Turning this option off or quitting strafe returns these
+combinations to macOS immediately; no system settings need restoring.
 Control+Option arrows are not registered or offered in this build.
 
-The option defaults to on and installs a separate active keyboard event tap.
-An explicitly saved off setting stays off across updates and restarts. That tap receives key-down/up events, passes unrelated keys and
-Command/Option/Shift combinations through unchanged, and never reads text or
-stores/logs keyboard input. A captured arrow's matching key-up is consumed even
-if Control is released first. Held arrows repeat at most once per 150 ms.
+How it works: while you hold Control, strafe turns off macOS's two Space
+shortcuts *in memory* and handles Control+Left/Right itself with a Carbon
+hotkey. When you release Control they are turned back on. The saved shortcut
+settings in System Settings are never edited. The option defaults to on, and an
+explicitly saved off setting stays off across updates and restarts.
+
+The tap that watches Control is a separate active event tap whose mask is
+`flagsChanged` only: it sees Control, Shift, Command, Option and Fn changes,
+never letters, numbers or arrow keys, and stores or logs nothing. The hotkey
+fires only for the exact Control+Left/Right combination. This uses the private
+WindowServer call `CGSSetSymbolicHotKeyEnabled`.
 
 If the tap cannot start, Accessibility is unavailable, or Mission Control is
-open, native handling remains available. Replacing an ad-hoc signed build may require refreshing its
-Accessibility entry. Secure Input and other software that intercepts keys can
-prevent delivery; automated tests do not establish live behavior on every Mac.
+open, native handling remains available. If strafe is force-quit or crashes
+*while Control is held*, the two native shortcuts stay off until strafe is
+started again (it restores them at launch) or you log out. Replacing an ad-hoc
+signed build may require refreshing its Accessibility entry. Held arrows do not
+repeat the switch. Automated tests do not establish live behavior on every Mac.
 
 ## Permissions
 
@@ -211,7 +219,8 @@ create an *active* event tap — the kind that can suppress the slow animated
 swipe and replace it with the instant one.
 
 The gesture tap sees only trackpad gesture and dock-control events. The optional
-Control-arrow feature adds a separate keyboard tap as described above. strafe
+Control-arrow feature adds a separate tap that sees modifier-key changes only,
+as described above. strafe
 has no network, telemetry, file access, or subprocess code. It saves your transition
 speed and hotkey preferences; AppKit also saves menu-bar icon visibility, which strafe resets
 on launch. See [SECURITY.md](SECURITY.md) for the exact file and line
@@ -222,7 +231,7 @@ strafe off (or remove it from the list).
 
 ## Uninstall
 
-1. Quit strafe from its menu-bar menu. Native Control-arrow shortcuts remain enabled.
+1. Quit strafe from its menu-bar menu.
 2. Delete `strafe.app`.
 3. Remove its entry from **System Settings › Privacy & Security ›
    Accessibility**.

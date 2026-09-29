@@ -3,18 +3,25 @@ import CoreGraphics
 import Foundation
 import CStrafe
 
-/// Optional, active keyboard tap. Main-run-loop confined, like SwipeInterceptor.
-/// It receives key-down/up events but only consumes Control+Left/Right. It never
-/// reads text, logs keys, or retains unrelated events. Native shortcuts stay on.
+/// Turns the native "Move left/right a space" shortcuts off in memory while
+/// Control is held, so a Carbon hotkey on Control+Left/Right can win and use
+/// strafe's instant switch. Native handling is back the moment Control is
+/// released. Main-run-loop confined, like SwipeInterceptor.
+///
+/// The only keyboard input this ever receives is modifier changes: its event
+/// tap masks `flagsChanged` and nothing else, so letters, numbers and other
+/// keys are never delivered. The Carbon hotkeys fire only for the exact combo.
 final class ControlArrowInterceptor: @unchecked Sendable {
     private let engine: SwitchEngine
+    private let shortcuts: NativeSpaceShortcuts
     private let canSwitch: () -> Bool
     private let isExposeActive: () -> Bool
-    private let now: () -> TimeInterval
+    private let currentFlags: () -> CGEventFlags
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
-    private var captured: UInt8 = 0
-    private var lastSwitch: TimeInterval = -.infinity
+    private var hotKeyHandler: EventHandlerRef?
+    private var hotKeys: [EventHotKeyRef] = []
+    private var suspended = false
 
     var isRunning: Bool {
         guard let eventTap else { return false }
@@ -22,13 +29,17 @@ final class ControlArrowInterceptor: @unchecked Sendable {
     }
 
     init(engine: SwitchEngine,
+         shortcuts: NativeSpaceShortcuts = SystemSpaceShortcuts(),
          canSwitch: @escaping () -> Bool = { Permissions.isAccessibilityGranted },
          isExposeActive: @escaping () -> Bool = { strafe_is_expose_active() },
-         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         currentFlags: @escaping () -> CGEventFlags = {
+             CGEventSource.flagsState(.combinedSessionState)
+         }) {
         self.engine = engine
+        self.shortcuts = shortcuts
         self.canSwitch = canSwitch
         self.isExposeActive = isExposeActive
-        self.now = now
+        self.currentFlags = currentFlags
     }
 
     func start() {
@@ -36,29 +47,37 @@ final class ControlArrowInterceptor: @unchecked Sendable {
             CGEvent.tapEnable(tap: eventTap, enable: true)
             return
         }
-        let mask = (CGEventMask(1) << CGEventType.keyDown.rawValue)
-            | (CGEventMask(1) << CGEventType.keyUp.rawValue)
+        // A previous run that died while Control was held leaves the native
+        // shortcuts off; put them back before anything else.
+        shortcuts.recoverIfNeeded()
+        guard registerHotKeys() else { return }
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap, place: .headInsertEventTap,
-            options: .defaultTap, eventsOfInterest: mask,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(1) << CGEventType.flagsChanged.rawValue,
             callback: { _, type, event, context in
                 guard let context else { return Unmanaged.passUnretained(event) }
-                return Unmanaged<ControlArrowInterceptor>.fromOpaque(context)
-                    .takeUnretainedValue().handle(type: type, event: event)
+                Unmanaged<ControlArrowInterceptor>.fromOpaque(context)
+                    .takeUnretainedValue().handleTap(type: type, flags: event.flags)
+                return Unmanaged.passUnretained(event)
             }, userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             FileHandle.standardError.write(Data(
-                "[ControlArrowInterceptor] Cannot create keyboard tap; native shortcuts remain available. Check Accessibility.\n".utf8))
+                "[ControlArrowInterceptor] Cannot create modifier tap; native shortcuts remain available. Check Accessibility.\n".utf8))
+            unregisterHotKeys()
             return
         }
         guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
             CFMachPortInvalidate(tap)
+            unregisterHotKeys()
             return
         }
         eventTap = tap
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        // Control may already be down when the option is switched on.
+        handleModifiers(currentFlags())
     }
 
     func stop() {
@@ -68,68 +87,144 @@ final class ControlArrowInterceptor: @unchecked Sendable {
         if let eventTap { CFMachPortInvalidate(eventTap) }
         runLoopSource = nil
         eventTap = nil
-        reset()
+        unregisterHotKeys()
+        resume()
     }
 
-    private func reset() {
-        captured = 0
-        lastSwitch = -.infinity
-    }
+    // MARK: - Modifier tracking
 
-    func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        let passthrough = Unmanaged.passUnretained(event)
+    func handleTap(type: CGEventType, flags: CGEventFlags) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            reset()
+            // Flag changes may have been missed; go back to native, re-arm,
+            // then resync from the real modifier state.
+            resume()
             if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
-            return passthrough
+            handleModifiers(currentFlags())
+            return
         }
-        guard type == .keyDown || type == .keyUp else { return passthrough }
-        let key = event.getIntegerValueField(.keyboardEventKeycode)
-        let bit: UInt8
-        let direction: SwitchDirection
-        switch key {
-        case Int64(kVK_LeftArrow): bit = 1; direction = .left
-        case Int64(kVK_RightArrow): bit = 2; direction = .right
-        default: return passthrough
-        }
-        if type == .keyUp {
-            guard captured & bit != 0 else { return passthrough }
-            captured &= ~bit
-            return nil // Match a consumed down even if Control was released first.
-        }
-        // Ignore Caps Lock and hardware arrow flags, but never take over
-        // Command/Option/Shift combinations, including existing Carbon hotkeys.
-        let modifiers: CGEventFlags = [.maskControl, .maskCommand, .maskAlternate, .maskShift]
-        let controlOnly = event.flags.intersection(modifiers) == .maskControl
-        let repeating = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-        if captured & bit != 0 {
-            // Keep the whole captured key sequence out of the native handler.
-            // Bound repeats so an 80–110ms ramp cannot build an unbounded queue.
-            if repeating && controlOnly && canSwitch() && !isExposeActive() {
-                let time = now()
-                if time - lastSwitch >= 0.15 {
-                    _ = fire(direction)
-                    lastSwitch = time
-                }
-            }
-            return nil
-        }
-        // Never acquire a key mid-hold: its original down may have reached an app.
-        guard !repeating, controlOnly, canSwitch(), !isExposeActive() else { return passthrough }
-        guard fire(direction) else { return passthrough }
-        captured |= bit
-        lastSwitch = now()
-        return nil
+        guard type == .flagsChanged else { return }
+        handleModifiers(flags)
     }
 
-    private func fire(_ direction: SwitchDirection) -> Bool {
+    func handleModifiers(_ flags: CGEventFlags) {
+        if flags.contains(.maskControl) {
+            // Leave Mission Control's own arrow handling alone.
+            guard !suspended, !isExposeActive() else { return }
+            suspended = shortcuts.suspend()
+        } else {
+            resume()
+        }
+    }
+
+    private func resume() {
+        guard suspended else { return }
+        suspended = false
+        shortcuts.resume()
+    }
+
+    // MARK: - Hotkeys
+
+    func handleHotKey(_ direction: SwitchDirection) {
+        // Native handling is off while Control is held, so there is nothing
+        // to pass through: an unavailable switch is simply a no-op.
+        guard canSwitch(), !isExposeActive() else { return }
         do {
             try engine.switchSpace(direction)
-            return true
         } catch SwitchEngineError.atEdge {
-            return true // Consume at the edge to avoid native bounce/double handling.
+            return // Same as native: nothing beyond the last Space.
         } catch {
-            return false // Initial failure leaves the original shortcut to macOS.
+            FileHandle.standardError.write(
+                Data("[ControlArrowInterceptor] switchSpace failed: \(error)\n".utf8))
         }
+    }
+
+    private func registerHotKeys() -> Bool {
+        guard hotKeys.isEmpty else { return true }
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userInfo -> OSStatus in
+                guard let userInfo, let event else { return OSStatus(eventNotHandledErr) }
+                var id = EventHotKeyID()
+                let status = GetEventParameter(
+                    event, EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID), nil,
+                    MemoryLayout<EventHotKeyID>.size, nil, &id)
+                guard status == noErr else { return status }
+                let direction: SwitchDirection
+                switch id.id {
+                case ControlArrowInterceptor.leftID: direction = .left
+                case ControlArrowInterceptor.rightID: direction = .right
+                default: return OSStatus(eventNotHandledErr)
+                }
+                Unmanaged<ControlArrowInterceptor>.fromOpaque(userInfo)
+                    .takeUnretainedValue().handleHotKey(direction)
+                return noErr
+            }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
+        guard status == noErr else { return false }
+        for (id, key) in [(Self.leftID, kVK_LeftArrow), (Self.rightID, kVK_RightArrow)] {
+            var ref: EventHotKeyRef?
+            let result = RegisterEventHotKey(
+                UInt32(key), UInt32(controlKey),
+                EventHotKeyID(signature: Self.signature, id: id),
+                GetApplicationEventTarget(), 0, &ref)
+            guard result == noErr, let ref else {
+                FileHandle.standardError.write(Data(
+                    "[ControlArrowInterceptor] RegisterEventHotKey failed (status \(result)); native shortcuts remain available.\n".utf8))
+                unregisterHotKeys()
+                return false
+            }
+            hotKeys.append(ref)
+        }
+        return true
+    }
+
+    private func unregisterHotKeys() {
+        for ref in hotKeys { UnregisterEventHotKey(ref) }
+        hotKeys = []
+        if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
+        hotKeyHandler = nil
+    }
+
+    private static let signature: OSType = 0x53_54_52_46 // 'STRF'
+    private static let leftID: UInt32 = 1
+    private static let rightID: UInt32 = 2
+}
+
+/// Switches the native Control+Left/Right Space shortcuts off and on. Live
+/// WindowServer state only; System Settings and its preference file are never
+/// edited, so nothing needs restoring in Settings.
+protocol NativeSpaceShortcuts {
+    /// Turn the native shortcuts off. False if that is not possible.
+    func suspend() -> Bool
+    func resume()
+    /// Re-enable after a run that ended while they were off.
+    func recoverIfNeeded()
+}
+
+struct SystemSpaceShortcuts: NativeSpaceShortcuts {
+    /// Set while the shortcuts are off, so a crash while Control was held is
+    /// healed the next time strafe starts. Cleared as soon as they are back.
+    static let suspendedStorageKey = "nativeSpaceShortcutsSuspended"
+
+    func suspend() -> Bool {
+        Preferences.store.set(true, forKey: Self.suspendedStorageKey)
+        guard strafe_set_space_arrow_shortcuts_enabled(false) else {
+            // Do not leave them half-off if only one call went through.
+            _ = strafe_set_space_arrow_shortcuts_enabled(true)
+            Preferences.store.set(false, forKey: Self.suspendedStorageKey)
+            return false
+        }
+        return true
+    }
+
+    func resume() {
+        _ = strafe_set_space_arrow_shortcuts_enabled(true)
+        Preferences.store.set(false, forKey: Self.suspendedStorageKey)
+    }
+
+    func recoverIfNeeded() {
+        if Preferences.store.bool(forKey: Self.suspendedStorageKey) { resume() }
     }
 }

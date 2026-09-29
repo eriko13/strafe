@@ -1,4 +1,3 @@
-import Carbon.HIToolbox
 import CoreGraphics
 import XCTest
 @testable import strafe
@@ -13,107 +12,115 @@ final class ControlArrowTests: XCTestCase {
         }
     }
 
-    private func key(_ code: Int = kVK_LeftArrow, down: Bool = true,
-                     flags: CGEventFlags = .maskControl, repeatKey: Bool = false) -> CGEvent {
-        let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: down)!
-        event.flags = flags
-        event.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0)
-        return event
-    }
-
-    func testBothDirectionsConsumeDownAndMatchingUp() {
-        let engine = Engine()
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true }, isExposeActive: { false })
-        for code in [kVK_LeftArrow, kVK_RightArrow] {
-            XCTAssertTrue(tap.handle(type: .keyDown, event: key(code)) == nil)
-            // Release Control before the arrow: the consumed arrow's up must still be swallowed.
-            XCTAssertTrue(tap.handle(type: .keyUp, event: key(code, down: false, flags: [])) == nil)
+    private final class Shortcuts: NativeSpaceShortcuts {
+        var events: [String] = []
+        var canSuspend = true
+        func suspend() -> Bool {
+            guard canSuspend else { return false }
+            events.append("suspend")
+            return true
         }
-        XCTAssertEqual(engine.directions.count, 2)
-        XCTAssertTrue(engine.directions[0] == .left && engine.directions[1] == .right)
+        func resume() { events.append("resume") }
+        func recoverIfNeeded() { events.append("recover") }
     }
 
-    func testUnrelatedTypingAndOtherModifiersPassUnchanged() {
-        let engine = Engine()
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true }, isExposeActive: { false })
-        for flags: CGEventFlags in [[], .maskShift, .maskCommand, .maskAlternate,
-                                   [.maskControl, .maskShift], [.maskControl, .maskAlternate],
-                                   [.maskControl, .maskCommand]] {
-            for type: CGEventType in [.keyDown, .keyUp] {
-                let event = key(down: type == .keyDown, flags: flags)
-                XCTAssertTrue(tap.handle(type: type, event: event)?.takeUnretainedValue() === event)
-            }
+    private func make(engine: Engine = Engine(), shortcuts: Shortcuts = Shortcuts(),
+                      canSwitch: Bool = true, expose: Bool = false,
+                      flags: CGEventFlags = []) -> ControlArrowInterceptor {
+        ControlArrowInterceptor(engine: engine, shortcuts: shortcuts,
+                                canSwitch: { canSwitch }, isExposeActive: { expose },
+                                currentFlags: { flags })
+    }
+
+    func testControlDownPausesNativeOnceAndControlUpResumes() {
+        let shortcuts = Shortcuts()
+        let tap = make(shortcuts: shortcuts)
+        tap.handleModifiers(.maskControl)
+        tap.handleModifiers([.maskControl, .maskShift]) // still held: no second call
+        XCTAssertEqual(shortcuts.events, ["suspend"])
+        tap.handleModifiers([])
+        tap.handleModifiers([]) // already back: no second call
+        XCTAssertEqual(shortcuts.events, ["suspend", "resume"])
+    }
+
+    func testOtherModifiersNeverPauseNative() {
+        let shortcuts = Shortcuts()
+        let tap = make(shortcuts: shortcuts)
+        for flags: CGEventFlags in [.maskShift, .maskCommand, .maskAlternate,
+                                   .maskAlphaShift, .maskSecondaryFn, []] {
+            tap.handleModifiers(flags)
         }
-        for code in [kVK_ANSI_A, kVK_Return, kVK_UpArrow, kVK_DownArrow] {
-            let event = key(code)
-            XCTAssertTrue(tap.handle(type: .keyDown, event: event)?.takeUnretainedValue() === event)
-        }
-        XCTAssertTrue(engine.directions.isEmpty)
+        XCTAssertTrue(shortcuts.events.isEmpty)
     }
 
-    func testHardwareArrowAndCapsLockFlagsDoNotBlockControl() {
+    func testMissionControlKeepsNativeArrowHandling() {
+        let shortcuts = Shortcuts()
+        let tap = make(shortcuts: shortcuts, expose: true)
+        tap.handleModifiers(.maskControl)
+        XCTAssertTrue(shortcuts.events.isEmpty)
+    }
+
+    func testUnavailablePrivateCallLeavesNativeAlone() {
+        let shortcuts = Shortcuts()
+        shortcuts.canSuspend = false
+        let tap = make(shortcuts: shortcuts)
+        tap.handleModifiers(.maskControl)
+        tap.handleModifiers([]) // nothing was paused, so nothing to resume
+        XCTAssertTrue(shortcuts.events.isEmpty)
+    }
+
+    func testHotKeySwitchesBothDirections() {
         let engine = Engine()
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true }, isExposeActive: { false })
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key(flags:
-            [.maskControl, .maskAlphaShift, .maskNumericPad, .maskSecondaryFn])) == nil)
-        XCTAssertEqual(engine.directions.count, 1)
+        let tap = make(engine: engine)
+        tap.handleHotKey(.left)
+        tap.handleHotKey(.right)
+        XCTAssertTrue(engine.directions == [.left, .right])
     }
 
-    func testRepeatedArrowIsBoundedAndNeverAcquiredMidHold() {
-        let engine = Engine()
-        var time = 0.0
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true },
-                                         isExposeActive: { false }, now: { time })
-        let unownedRepeat = key(repeatKey: true)
-        XCTAssertFalse(tap.handle(type: .keyDown, event: unownedRepeat) == nil)
-        XCTAssertTrue(engine.directions.isEmpty)
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key()) == nil)
-        time = 0.1
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key(repeatKey: true)) == nil)
-        XCTAssertEqual(engine.directions.count, 1)
-        time = 0.2
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key(repeatKey: true)) == nil)
-        XCTAssertEqual(engine.directions.count, 2)
-        time = 0.4
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key(flags: [.maskControl, .maskShift], repeatKey: true)) == nil)
-        XCTAssertEqual(engine.directions.count, 2)
-        XCTAssertTrue(tap.handle(type: .keyUp, event: key(down: false)) == nil)
-        XCTAssertFalse(tap.handle(type: .keyDown, event: unownedRepeat) == nil)
-    }
-
-    func testUnavailablePermissionAndOverlayLeaveNativeShortcutIntact() {
+    func testHotKeyIgnoredWithoutPermissionOrDuringMissionControl() {
         for (permission, overlay) in [(false, false), (true, true)] {
             let engine = Engine()
-            let tap = ControlArrowInterceptor(engine: engine, canSwitch: { permission }, isExposeActive: { overlay })
-            let event = key()
-            XCTAssertTrue(tap.handle(type: .keyDown, event: event)?.takeUnretainedValue() === event)
-            XCTAssertFalse(tap.handle(type: .keyUp, event: key(down: false)) == nil)
+            make(engine: engine, canSwitch: permission, expose: overlay).handleHotKey(.left)
             XCTAssertTrue(engine.directions.isEmpty)
         }
     }
 
-    func testInitialPostFailureFallsBackButBoundaryIsConsumed() {
+    func testEdgeAndEngineFailuresDoNotCrash() {
         let engine = Engine()
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true }, isExposeActive: { false })
-        engine.error = .postFailed
-        XCTAssertFalse(tap.handle(type: .keyDown, event: key()) == nil)
-        XCTAssertFalse(tap.handle(type: .keyUp, event: key(down: false)) == nil)
+        let tap = make(engine: engine)
         engine.error = .atEdge
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key()) == nil)
-        XCTAssertTrue(tap.handle(type: .keyUp, event: key(down: false)) == nil)
+        tap.handleHotKey(.left)
+        engine.error = .postFailed
+        tap.handleHotKey(.right)
+        XCTAssertTrue(engine.directions.isEmpty)
     }
 
-    func testTimeoutAndStopClearCapturedKeys() {
-        let engine = Engine()
-        let tap = ControlArrowInterceptor(engine: engine, canSwitch: { true }, isExposeActive: { false })
+    func testTapTimeoutResumesNativeThenResyncsFromRealModifiers() {
         for type: CGEventType in [.tapDisabledByTimeout, .tapDisabledByUserInput] {
-            XCTAssertTrue(tap.handle(type: .keyDown, event: key()) == nil)
-            XCTAssertFalse(tap.handle(type: type, event: key()) == nil)
-            XCTAssertFalse(tap.handle(type: .keyUp, event: key(down: false)) == nil)
+            // Control still down after the disable: pause again.
+            var shortcuts = Shortcuts()
+            var tap = make(shortcuts: shortcuts, flags: .maskControl)
+            tap.handleModifiers(.maskControl)
+            tap.handleTap(type: type, flags: [])
+            XCTAssertEqual(shortcuts.events, ["suspend", "resume", "suspend"])
+
+            // Control released while the tap was off: stay on native.
+            shortcuts = Shortcuts()
+            tap = make(shortcuts: shortcuts, flags: [])
+            tap.handleModifiers(.maskControl)
+            tap.handleTap(type: type, flags: [])
+            XCTAssertEqual(shortcuts.events, ["suspend", "resume"])
         }
-        XCTAssertTrue(tap.handle(type: .keyDown, event: key()) == nil)
+    }
+
+    func testStopGivesNativeShortcutsBack() {
+        let shortcuts = Shortcuts()
+        let tap = make(shortcuts: shortcuts)
+        tap.handleModifiers(.maskControl)
         tap.stop()
-        XCTAssertFalse(tap.handle(type: .keyUp, event: key(down: false)) == nil)
+        XCTAssertEqual(shortcuts.events, ["suspend", "resume"])
         XCTAssertFalse(tap.isRunning)
+        tap.stop() // idempotent
+        XCTAssertEqual(shortcuts.events, ["suspend", "resume"])
     }
 }

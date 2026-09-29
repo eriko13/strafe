@@ -38,7 +38,8 @@ final class HotkeyManager {
         controlArrows.stop()
     }
 
-    /// Apply the shared preference without changing native macOS shortcuts.
+    /// Apply the shared preference. Native macOS shortcuts are only paused in
+    /// memory, while Control is held.
     func applyStoredState() {
         // Refresh the cache after another process changes the shared preference.
         Preferences.store.synchronize()
@@ -59,12 +60,14 @@ final class HotkeyManager {
         Keep macOS “Move left a space” and “Move right a space” enabled.
 
         While strafe runs, Control+Left/Right uses your chosen transition speed. \
-        No Option, Command, or Shift key is needed. Quitting strafe or turning \
-        this option off returns these shortcuts to macOS.
+        No Option, Command, or Shift key is needed. While Control is held, strafe \
+        pauses those two macOS shortcuts in memory; they return when you release \
+        Control, quit strafe, or turn this option off. Your saved shortcut settings \
+        are never edited.
 
-        This option adds a keyboard event tap. It receives key-down/up events, \
-        but only consumes Control+Left/Right; other input passes through without \
-        being stored or logged. Accessibility permission is required.
+        This option adds a modifier-key event tap. It sees Control, Shift, Command, \
+        Option and Fn changes only, never letters, numbers or other keys. \
+        Accessibility permission is required.
         """
 
     nonisolated static func persist(controlArrowsEnabled: Bool) {

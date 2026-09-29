@@ -25,7 +25,8 @@ credential anywhere in this repository to steal.
 
 strafe installs an active gesture `CGEventTap` and holds Accessibility permission
 to do so. That tap covers only gesture and dock-control events. The optional
-Control-arrow feature installs a second active keyboard tap; see below.
+Control-arrow feature installs a second active tap that sees modifier-key
+changes only; see below.
 
 - **Tap mask definition:** `Sources/CStrafe/CStrafe.c`, function
   `strafe_tap_event_mask()` (line 289):
@@ -38,8 +39,8 @@ Control-arrow feature installs a second active keyboard tap; see below.
 
   That is `(1<<29) | (1<<30)` — the two private trackpad-gesture event types
   and nothing else. There is no `kCGEventKeyDown`/`kCGEventKeyUp` bit. There is no
-  setting that widens this gesture mask. The optional keyboard tap uses a
-  separate key-down/up mask.
+  setting that widens this gesture mask. The optional modifier tap uses a
+  separate `flagsChanged`-only mask.
 
 - **Why keys are excluded — determination comment:** immediately above that
   function in `Sources/CStrafe/CStrafe.c` (the `KEY-EVENTS-IN-MASK
@@ -54,28 +55,37 @@ Control-arrow feature installs a second active keyboard tap; see below.
   options: .defaultTap, eventsOfInterest: mask, ...)` where `mask` comes
   straight from `strafe_tap_event_mask()` above.
 
-### Optional keyboard interception
+### Optional Control-arrow switching
 
-`ControlArrowInterceptor.swift` installs a separate `cgSessionEventTap` at
-`headInsertEventTap` for key-down and key-up events only when
-`controlArrowHotkeysEnabled` is true (default true). **This tap receives
-keyboard events system-wide.** It immediately passes non-arrow keys through;
-for Left/Right it reads the keycode, modifier flags, and autorepeat flag. It
-never reads Unicode text, logs keys, or retains unrelated events.
+When `controlArrowHotkeysEnabled` is true (default true),
+`ControlArrowInterceptor.swift` does two things:
 
-Only Control+Left/Right is consumed. Command/Option/Shift combinations pass
-through. State consists of two captured-arrow bits and a repeat timestamp;
-matching key-up is consumed even if Control was released first. The callback
-also checks Accessibility and the existing overlay guard before starting a
-switch. Initial engine failure passes the shortcut through; a workspace edge
-is consumed to avoid native bounce. Repeats are bounded to one per 150 ms.
+- **Modifier-only tap.** It installs a separate active `cgSessionEventTap`
+  (`headInsertEventTap`) whose mask is `flagsChanged` only. macOS delivers
+  modifier changes (Control, Shift, Command, Option, Caps Lock, Fn) to it and
+  nothing else: **key-down and key-up events, and therefore letters, numbers
+  and arrow keys, are never delivered.** The callback reads the modifier flags
+  and always passes the event through unchanged.
+- **Carbon hotkeys.** It registers `RegisterEventHotKey` for Control+Left and
+  Control+Right. macOS calls back only for those exact combinations, and only
+  when the native shortcuts are off.
 
-The keyboard tap has per-keystroke callback overhead. Turning Control-arrow
-interception off leaves only the gesture tap and avoids that keyboard overhead. Disabling the option removes it completely; stopping or
-crashing the process removes interception and leaves native macOS shortcuts
-available. strafe does not disable or rewrite system shortcuts. Timeout/user
-input disable notifications reset captured-key state before re-enabling the
-tap. No additional input types are added to the gesture tap.
+While Control is held, `strafe_set_space_arrow_shortcuts_enabled(false)`
+(`Sources/CStrafe/CStrafe.c`) calls the private, weak-imported
+`CGSSetSymbolicHotKeyEnabled` for the two "Move left/right a space" shortcuts
+(IDs 79 and 81). Releasing Control, stopping the tap, quitting, or a tap
+timeout turns them back on. This changes live WindowServer state only;
+strafe never reads or writes `com.apple.symbolichotkeys`. It skips the pause
+while Mission Control is open, and checks Accessibility and that overlay guard
+before switching.
+
+**Failure mode:** if the process is killed or crashes while Control is held,
+the native shortcuts stay off until strafe starts again or you log out. strafe
+sets a `nativeSpaceShortcutsSuspended` flag while paused and, at its next
+launch, re-enables them if it finds that flag set. At any other time
+(Control not held) a crash leaves native shortcuts untouched.
+
+The modifier tap has per-modifier-change callback overhead only.
 
 ### Exactly what event data strafe touches
 
@@ -92,8 +102,8 @@ the wrappers in `Sources/CStrafe/CStrafe.c` (lines 221–242):
 
 That is the gesture event data strafe inspects: enough to tell a real
 horizontal 3-finger space swipe from anything else, and its direction. No
-coordinates, no window contents, and no clipboard. The optional keyboard
-tap reads keycodes as documented above.
+coordinates, no window contents, and no clipboard. The optional modifier tap
+reads modifier flags only, as documented above.
 
 On macOS 27 and later, `Sources/CStrafe/IOHIDPayload.c` also serializes synthetic
 events in memory to attach the raw IOHID payload required by the Dock (field
@@ -169,22 +179,25 @@ Each of these is verifiable with a single grep over `Sources/`.
   (`grep -rniE 'Process\(\)|/usr/bin|/bin/|tccutil' Sources/` — no spawns).
 
 - **Persistence is limited to menu settings.** strafe stores no databases and no
-  caches. Its own code writes two `UserDefaults` values: `transitionSpeed`, an integer
+  caches. Its own code writes three `UserDefaults` values: `transitionSpeed`, an integer
   0–2 recording which **Transition speed** preset you picked in the menu
   (`TransitionSpeed`, `Sources/strafe/TransitionSpeed.swift` line 101);
   `controlArrowHotkeysEnabled`, a bool defaulting to true that enables
-  Control+Left/Right interception (`HotkeyManager`,
-  `Sources/strafe/HotkeyManager.swift`). Neither changes the gesture tap's mask.
-  The first changes the shape of the synthetic gesture; the second installs or
-  removes the separate keyboard tap. The old `spaceHotkeysEnabled` value is
-  ignored; this build has no Carbon shortcut registrations.
+  Control+Left/Right switching (`HotkeyManager`,
+  `Sources/strafe/HotkeyManager.swift`); and `nativeSpaceShortcutsSuspended`,
+  a bool set only while strafe has the two native shortcuts paused, so a
+  crash mid-hold can be repaired at the next launch (`SystemSpaceShortcuts`,
+  `Sources/strafe/ControlArrowInterceptor.swift`). None changes the gesture
+  tap's mask. The first changes the shape of the synthetic gesture; the second
+  starts or stops the modifier tap and Carbon hotkeys. The old
+  `spaceHotkeysEnabled` value is ignored.
 
   Reads and writes go through one accessor, so the two launch modes
   (`strafe.app` and the bare CLI, which has no bundle id) cannot land in
   different plists:
 
   ```
-  grep -rn 'Preferences.store' Sources/   # two keys, plus cache synchronization
+  grep -rn 'Preferences.store' Sources/   # three keys, plus cache synchronization
   grep -rn 'UserDefaults(' Sources/       # one hit: the suite in Preferences.swift
   ```
 
@@ -195,13 +208,14 @@ Each of these is verifiable with a single grep over `Sources/`.
   Changing the hotkey setting flushes the shared preference and posts a local
   `DistributedNotificationCenter` notification in the same login session.
   It carries no payload. A running strafe rereads its own preference and
-  updates its optional keyboard tap; it does not accept
+  starts or stops its optional modifier tap; it does not accept
   commands or settings from notification data. This adds no network access or
   permissions.
 
-  strafe neither reads nor writes native symbolic-hotkey preferences. Users
-  keep their macOS Space shortcuts enabled; no restoration is needed on quit
-  or uninstall.
+  strafe neither reads nor writes the native symbolic-hotkey preferences file.
+  Users keep their macOS Space shortcuts enabled in System Settings; strafe
+  only pauses them in memory while Control is held, so no restoration in
+  Settings is needed on quit or uninstall.
 
   No usage data, no history, no coordinates are stored.
   Deleting `strafe.app` leaves behind only that plist, which
@@ -242,7 +256,7 @@ wc -l Sources/strafe/*.swift Sources/CStrafe/CStrafe.c Sources/CStrafe/include/C
 grep -rniE 'URLSession|NSURL|Network|CFSocket|socket|curl|http://|https://|dlopen|dlsym' Sources/
 grep -rniE 'Process\(\)|tccutil|/usr/bin|/bin/' Sources/
 
-# 4. Inspect the gesture-only mask and optional keyboard mask.
+# 4. Inspect the gesture-only mask and the modifier-only mask.
 grep -rn 'strafe_tap_event_mask' Sources/
 cat Sources/strafe/ControlArrowInterceptor.swift
 
@@ -253,8 +267,8 @@ grep -rn 'Preferences.store' Sources/
 For the deep dive on exactly which private CGEvent fields are used and why, read
 `docs/SPEC.md`. Caveat: `docs/SPEC.md` documents the upstream reference
 implementation strafe was reimplemented from. Its `tccutil` call and gesture
-tap key-event masking are not used here. This local
-build instead has the separate toggleable keyboard tap described above.
+tap key-event masking are not used here. This build instead has the separate
+toggleable modifier-only tap and Carbon hotkeys described above.
 
 ---
 
