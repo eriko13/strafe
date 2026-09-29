@@ -323,13 +323,14 @@ int32_t strafe_field_gesture_phase(void)    { return (int32_t)kCGEventGesturePha
 //   - Tap re-enable is handled via the kCGEventTapDisabledByTimeout /
 //     ByUserInput callbacks, which the system delivers to the callback
 //     REGARDLESS of the event mask — so dropping keys does not affect re-enable.
-//   - Global switch hotkeys use Carbon RegisterEventHotKey (HotkeyManager), a
-//     separate mechanism that does not depend on this tap seeing key events.
+//   - Optional Control-arrow switching uses ControlArrowInterceptor, a
+//     separate keyboard tap. It does not widen this gesture-only mask.
 // Cost of the old mask: every keystroke system-wide round-tripped synchronously
 // through this process's active tap only to be passed through, adding keyboard
 // latency and a wakeup per key. With keys removed the active tap wakes only on
-// real space-swipe gestures, dropping idle keyboard wakeups to zero. Behavior is
-// unchanged because the removed events were never acted upon.
+// real space-swipe gestures. The separate toggleable keyboard tap still incurs
+// keyboard callbacks when enabled. Gesture behavior is unchanged because the
+// removed events were never acted upon by this tap.
 uint64_t strafe_tap_event_mask(void) {
     return (1ULL << kCGSEventGesture) | (1ULL << kCGSEventDockControl);
 }

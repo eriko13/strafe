@@ -64,8 +64,9 @@ Space switching instant. Steps:
 
 1. Clone the repo and read SECURITY.md, then skim the source (~1,486 lines,
    no dependencies) and confirm the claims hold: the event tap mask covers
-   only gesture events, and there is no network, subprocess, or file-write
-   code. Tell me what you found before proceeding.
+   only gesture events; Control-arrow interception adds
+   a keyboard tap with no text reading or input logging. There is no network,
+   subprocess, or file-write code. Tell me what you found before proceeding.
 2. Run ./Scripts/bundle.sh and move build/strafe.app to /Applications.
 3. Launch it, then open System Settings > Privacy & Security > Accessibility
    so I can grant it permission. Remove any stale strafe entries first.
@@ -147,10 +148,10 @@ This update was tested on macOS 27.0; older macOS versions have not been reteste
 
 - **3-finger swipe** — just works once strafe is running and has Accessibility.
   Swipe left/right between Spaces and the switch is instant.
-- **Keyboard** — `ctrl`+`opt`+`←` and `ctrl`+`opt`+`→` switch Spaces.
-  Turn off **Space-switch hotkeys** in the menu if these conflict with another
-  app. Swipes keep working. `strafe hotkeys off` and `strafe hotkeys on` also
-  update a running copy without restarting it.
+- **Keyboard** — **Speed up Control + ←/→…** is enabled by default to switch
+  with Control + Left/Right. Keep macOS's default Space shortcuts enabled.
+  `strafe control-arrows on` and `strafe control-arrows off` update the running
+  app without restarting. This build does not register Control+Option arrows.
 - **Menu bar** — click the strafe icon to enable/disable interception, check
   whether Accessibility has been granted, and see which version you're running
   and where to get a newer one.
@@ -177,9 +178,31 @@ This update was tested on macOS 27.0; older macOS versions have not been reteste
   strafe switch left|right   # switch once and exit
   strafe status              # print accessibility / tap status
   strafe speed [preset]      # show or set transition speed
-  strafe hotkeys [on|off]    # show or set Space-switch hotkeys
+  strafe control-arrows [on|off] # show or set Control-arrow interception
   strafe                     # start the menu-bar app
   ```
+
+### Control + arrow switching without changing macOS shortcuts
+
+Leave **Move left a space** and **Move right a space** enabled in macOS.
+**Speed up Control + ←/→…** is enabled on first launch. To re-enable it, run
+`strafe control-arrows on`. Only Control plus an arrow is needed.
+
+While strafe runs, it consumes Control+Left/Right and uses the same transition
+speed as trackpad swipes. Turning this option off or quitting strafe returns
+these combinations to macOS immediately; no system settings need restoring.
+Control+Option arrows are not registered or offered in this build.
+
+The option defaults to on and installs a separate active keyboard event tap.
+An explicitly saved off setting stays off across updates and restarts. That tap receives key-down/up events, passes unrelated keys and
+Command/Option/Shift combinations through unchanged, and never reads text or
+stores/logs keyboard input. A captured arrow's matching key-up is consumed even
+if Control is released first. Held arrows repeat at most once per 150 ms.
+
+If the tap cannot start, Accessibility is unavailable, or Mission Control is
+open, native handling remains available. Replacing an ad-hoc signed build may require refreshing its
+Accessibility entry. Secure Input and other software that intercepts keys can
+prevent delivery; automated tests do not establish live behavior on every Mac.
 
 ## Permissions
 
@@ -187,9 +210,9 @@ strafe needs **Accessibility** permission, and only that. macOS requires it to
 create an *active* event tap — the kind that can suppress the slow animated
 swipe and replace it with the instant one.
 
-The tap sees only trackpad gesture and dock-control events. It does **not** see
-keystrokes: the event mask excludes key events entirely, and strafe has no
-network, telemetry, file access, or subprocess code. It saves your transition
+The gesture tap sees only trackpad gesture and dock-control events. The optional
+Control-arrow feature adds a separate keyboard tap as described above. strafe
+has no network, telemetry, file access, or subprocess code. It saves your transition
 speed and hotkey preferences; AppKit also saves menu-bar icon visibility, which strafe resets
 on launch. See [SECURITY.md](SECURITY.md) for the exact file and line
 pointers.
@@ -199,7 +222,7 @@ strafe off (or remove it from the list).
 
 ## Uninstall
 
-1. Quit strafe from its menu-bar menu.
+1. Quit strafe from its menu-bar menu. Native Control-arrow shortcuts remain enabled.
 2. Delete `strafe.app`.
 3. Remove its entry from **System Settings › Privacy & Security ›
    Accessibility**.
